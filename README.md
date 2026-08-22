@@ -1,3 +1,5 @@
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-dawgog-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/dawgog) https://buymeacoffee.com/dawgog
+
 # zen-proxy
 
 Use **OpenCode Zen's free models** — Ox Alpha (`x-preview-f-free`, 1M context), Big Pickle, and
