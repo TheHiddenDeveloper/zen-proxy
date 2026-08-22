@@ -1,0 +1,33 @@
+# deepseek-harness (https://github.com/deepseek-ai/deepseek-harness)
+# Merge into $DSH_HOME/settings.yaml (default: ~/.dsh/settings.yaml). Start `zen-proxy` first.
+#
+# Why the proxy: the harness's LLM layer (pi-ai) always sends an Authorization header, and Zen's
+# free endpoint answers 401 "Invalid API key" to any key that isn't a real one. The proxy strips
+# the placeholder and also rewrites the `developer` role / `max_completion_tokens` pi-ai sends,
+# both of which Zen rejects.
+agent-default-model:
+  provider: ox-alpha
+  model: x-preview-f-free
+llm-pi-ai:
+  providers:
+    ox-alpha:
+      displayName: Ox Alpha (Zen free, via zen-proxy)
+      api: openai-completions
+      baseURL: http://127.0.0.1:4040/v1
+      headers:
+        Authorization: Bearer zen-proxy-placeholder
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 32000
+      compat:
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        supportsStore: false
+      models:
+        - id: x-preview-f-free
+          name: Ox Alpha Free (1M)
+          contextWindow: 1000000
+          maxTokens: 32000
+          reasoningEfforts:   # the only levels Zen accepts for this model; thinking can't be turned off
+            low: low
+            high: high
+            max: max

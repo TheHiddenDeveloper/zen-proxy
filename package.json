@@ -1,0 +1,26 @@
+{
+  "name": "zen-proxy",
+  "version": "1.0.0",
+  "description": "Use OpenCode Zen's free models (Ox Alpha, Big Pickle, ...) from Claude Code and any OpenAI-compatible client, without an API key. Zero dependencies.",
+  "license": "MIT",
+  "author": "Dhruvik Chauhan (https://github.com/Dalailalama)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dalailalama/zen-proxy.git"
+  },
+  "homepage": "https://github.com/Dalailalama/zen-proxy#readme",
+  "bugs": "https://github.com/Dalailalama/zen-proxy/issues",
+  "keywords": ["opencode", "zen", "ox-alpha", "claude-code", "anthropic", "openai-compatible", "proxy", "stealth-model", "deepseek-harness"],
+  "type": "commonjs",
+  "main": "proxy.js",
+  "bin": {
+    "zen-proxy-server": "proxy.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node proxy.js",
+    "test": "node test/run.mjs"
+  }
+}

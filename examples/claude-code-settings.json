@@ -1,0 +1,18 @@
+{
+  "//": "Alternative to the claude-ox launcher: put this in a project's .claude/settings.local.json and run plain `claude` there. Start zen-proxy first.",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4040",
+    "ANTHROPIC_AUTH_TOKEN": "zen-proxy",
+    "ANTHROPIC_MODEL": "ox-alpha",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "ox-alpha",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "ox-alpha",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ox-alpha",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "ox-alpha",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "ox-alpha",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "ox-alpha",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Ox Alpha (Zen, free)",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "API_TIMEOUT_MS": "600000"
+  }
+}
