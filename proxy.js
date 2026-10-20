@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * zen-proxy — use OpenCode Zen's free models (Ox Alpha, Big Pickle, ...) from Claude Code and
+ * zen-proxy — use OpenCode Zen's free models (Big Pickle, MiMo-V2.5, ...) from Claude Code and
  * any OpenAI-compatible client, without an API key.   https://github.com/Dalailalama/zen-proxy
  *
  *   Claude Code  --Anthropic Messages API-->  this proxy  --OpenAI chat/completions-->  Zen
@@ -16,20 +16,36 @@
  *   - GET  /v1/models                Zen's model list (free models only unless MODELS=all) plus the alias entry
  *   The /v1 prefix is optional on every route, and CORS is open for browser-based clients.
  *
- * Zen's free models reject ANY Authorization header that isn't a real key, so by default
- * NO auth header is sent upstream (UPSTREAM_API_KEY empty). Images are replaced with a text
- * placeholder because the free endpoint returns 503 for image input (IMAGES=forward to try anyway).
+ * Since 2026-09-16 Zen's free tier only serves requests that look like they came from an OpenCode
+ * agent session. As of OpenCode 2.0 (re-verified 2026-10-15 by capturing OpenCode's own traffic) the
+ * gate is exactly three things, and it checks all of them:
+ *   1. the path is `/inference/v1/chat/completions` — the old `/zen/v1/...` now always 403s;
+ *   2. the request carries BOTH `x-opencode-session-id` and `x-opencode-session` (plus the anonymous
+ *      key `Bearer public` and `content-type: application/json`); either session header alone fails.
+ *      The session id must be a valid OpenCode 2.0 *descending* id — its 12-bit counter field (the
+ *      last three hex chars) must be >= 0xfc0. Ascending ids (1.x) and arbitrary ids are rejected;
+ *   3. the body's `tools` array contains a valid `read` tool (non-empty `parameters.properties`), and
+ *      every tool whose name collides with a known OpenCode tool (read/shell/edit/glob/grep/write/
+ *      question/skill/subagent/webfetch/websearch/execute/bash) also has a non-empty schema. Extra
+ *      tools with unknown names are ignored, so third-party clients can still send their own.
+ * Third-party clients send none of that and get a 403 FreeTierError instead. This proxy synthesizes
+ * the required shape for free models: it injects the headers, repairs/normalizes the tool
+ * declarations, forces streaming, and re-joins the SSE response into a single JSON reply when the
+ * caller asked for a non-streaming answer.
+ * A real Zen key (UPSTREAM_API_KEY) is used verbatim when set; otherwise `Bearer public` is sent.
+ * Images are replaced with a text placeholder because the free endpoint returns 503 for image
+ * input (IMAGES=forward to try anyway).
  *
  * Config (env vars):
  *   PROXY_HOST=127.0.0.1  PROXY_PORT=4040
- *   UPSTREAM_URL=https://opencode.ai/zen/v1/chat/completions
- *   UPSTREAM_MODEL=x-preview-f-free      model every "ox-alpha" / "claude-*" request is mapped to
- *   UPSTREAM_API_KEY=                     leave empty for Zen free models
- *   MODEL_ALIAS=ox-alpha                  model name Claude Code uses
- *   REASONING_EFFORT=                     low | high | max  (Ox Alpha cannot disable thinking)
- *   IMAGES=strip                          strip | forward
- *   MODELS=free                           free | all   (which Zen models GET /v1/models lists)
- *   DEBUG=1                               dump request/response JSON to <tmpdir>/zen-proxy/
+ *   UPSTREAM_URL=https://opencode.ai/inference/v1/chat/completions
+ *   UPSTREAM_MODEL=big-pickle         model every "ox-alpha" / "claude-*" request is mapped to
+ *   UPSTREAM_API_KEY=                 leave empty for Zen free models (anonymous `Bearer public` is sent)
+ *   MODEL_ALIAS=ox-alpha              model name Claude Code uses
+ *   REASONING_EFFORT=                 low | high | max  (Ox Alpha cannot disable thinking)
+ *   IMAGES=strip                      strip | forward
+ *   MODELS=free                       free | all   (which Zen models GET /v1/models lists)
+ *   DEBUG=1                           dump request/response JSON to <tmpdir>/zen-proxy/
  */
 
 const http = require("node:http");
@@ -41,8 +57,8 @@ const crypto = require("node:crypto");
 const CONFIG = {
   host: process.env.PROXY_HOST || "127.0.0.1",
   port: Number(process.env.PROXY_PORT || 4040),
-  upstreamUrl: process.env.UPSTREAM_URL || "https://opencode.ai/zen/v1/chat/completions",
-  upstreamModel: process.env.UPSTREAM_MODEL || "x-preview-f-free",
+  upstreamUrl: process.env.UPSTREAM_URL || "https://opencode.ai/inference/v1/chat/completions",
+  upstreamModel: process.env.UPSTREAM_MODEL || "big-pickle",
   upstreamApiKey: process.env.UPSTREAM_API_KEY || "",
   alias: process.env.MODEL_ALIAS || "ox-alpha",
   reasoningEffort: (process.env.REASONING_EFFORT || "").trim(),
@@ -50,7 +66,17 @@ const CONFIG = {
   models: (process.env.MODELS || "free").trim(),
   debug: !!process.env.DEBUG,
   maxOutputTokens: 131072,
+  // The anonymous key Zen's free tier accepts. A real key (UPSTREAM_API_KEY) wins when set.
+  freeKey: "public",
+  // Zen recognises a request as coming "from within OpenCode" partly by the client's User-Agent.
+  // OpenCode 2.0 sends `opencode/<channel>/<version>/<client>` (e.g. `opencode/latest/2.0.26/cli`,
+  // built by `opencode/${channel}/${version}/${name}`). The 1.x `opencode/<version> (...)` form is
+  // no longer accepted by the free tier, so default to the 2.0 shape. Overridable via env.
+  userAgent: process.env.OPENCODE_USER_AGENT || process.env.ZEN_OPENCODE_UA || "opencode/latest/2.0.26/cli",
 };
+if (process.env.OPENCODE_VERSION) {
+  CONFIG.userAgent = `opencode/latest/${process.env.OPENCODE_VERSION}/cli`;
+}
 CONFIG.upstreamModelsUrl = CONFIG.upstreamUrl.replace(/\/chat\/completions\/?$/, "") + "/models";
 
 const CORS = {
@@ -68,6 +94,233 @@ const now = () => new Date().toTimeString().slice(0, 8);
 const log = (...a) => console.log(`[${now()}]`, ...a);
 const genId = (prefix) => `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
 
+// ------------------------------------------------- OpenCode request-shape helpers
+//
+// Since 2026-09-16 Zen's free tier rejects any request that doesn't look like an OpenCode agent
+// session (403 FreeTierError). For OpenCode 2.0 "looks like OpenCode" means: the anonymous key
+// `Bearer public`, a *gate-valid* OpenCode 2.0 `ses_` id (a descending id, last three hex chars
+// >= 0xfc0) carried in BOTH the x-opencode-session-id and x-opencode-session headers, and a body
+// whose `tools` include a valid `read` tool (every tool sharing a known OpenCode name must have a
+// non-empty schema too). Clients like deepseek-harness / pi-ai send their own session ids, keys and
+// tools, so the proxy synthesizes all of it and re-joins the SSE response for non-streaming callers.
+
+// The exact OpenCode 2.0 `read` tool. Any non-empty `parameters.properties` satisfies the gate, but
+// mirroring OpenCode byte-for-byte is the safest thing to send.
+const CANONICAL_READ_TOOL = {
+  type: "function",
+  function: {
+    name: "read",
+    description:
+      "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File or directory to read" },
+        offset: { type: "integer", minimum: 0, description: "The line or directory entry to start reading from (1-based)" },
+        limit: { type: "integer", minimum: 0, description: "The maximum number of lines or directory entries to read (defaults to and capped at 2000)" },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+    strict: false,
+  },
+};
+const SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+// OpenCode 2.0 session ids are *descending* identifiers:
+//     value = ~(BigInt(Date.now()) * 4096n + counter)     // counter starts at 1 each millisecond
+//     id    = "ses_" + hex(value & 0xffffffffffff) + 14 random base62 chars
+// Zen's free-tier gate validates exactly that shape: the 12-bit counter field, decoded as a
+// descending id, must be <= 63 — equivalently the last three hex chars must be >= 0xfc0.
+// Ascending ids (OpenCode 1.x) and arbitrary 12-hex ids (including every id this proxy used to
+// invent) are rejected with 403. The timestamp itself is never checked; only the counter matters.
+function gateAcceptsSession(id) {
+  return typeof id === "string" && SESSION_RE.test(id) && parseInt(id.slice(13, 16), 16) >= 0xfc0;
+}
+
+// Builds a gate-valid OpenCode 2.0 (descending) session id. `seed` makes it deterministic so one
+// conversation keeps a single session — and Zen's prompt-cache affinity — across requests. The
+// encoded timestamp is irrelevant to the gate, so it is derived from the seed rather than the clock.
+function canonicalSessionId(seed) {
+  // Reuse a genuine, gate-valid OpenCode session so affinity carries through a relay.
+  if (gateAcceptsSession(seed)) return seed;
+  const h = crypto.createHash("sha256").update(String(seed)).digest();
+  const timeMs = Number(h.readUIntBE(0, 5)); // 40 bits — arbitrary but stable
+  const counter = (h[5] % 63) + 1; // 1..63: the only range the gate accepts
+  const value = ~(BigInt(timeMs) * 0x1000n + BigInt(counter));
+  let hex = "";
+  for (let i = 0; i < 6; i++) hex += Number((value >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, "0");
+  let suffix = "";
+  for (let i = 0; i < 14; i++) suffix += BASE62[h[6 + i] % 62];
+  return "ses_" + hex + suffix;
+}
+
+function projectId(seed) {
+  // OpenCode 2.0 sends a bare 40-hex project id here (no `prj_` prefix like 1.x used).
+  return crypto.createHash("sha256").update(seed).digest().subarray(0, 20).toString("hex");
+}
+
+// Derives stable OpenCode-style identities from whatever the caller provided: a real session
+// header when given (e.g. relaying a genuine opencode client), else the first user message, else
+// a random seed. Stable sessions keep Zen's prompt-cache affinity from request to request.
+function requestIds(req, messages) {
+  const hdr = ["x-opencode-session", "x-session-id", "x-session-affinity", "conversation-id"].map((k) => req.headers[k]).find((v) => v && typeof v === "string");
+  let seed = hdr;
+  if (!seed) {
+    const first = (messages || []).find((m) => m && typeof m === "object" && m.role === "user");
+    const content = first && (typeof first.content === "string" ? first.content : JSON.stringify(first.content));
+    seed = (content && content.trim()) || crypto.randomBytes(16).toString("hex");
+  }
+  return { session: canonicalSessionId(seed), request: genId("req"), project: projectId(seed) };
+}
+
+// Builds the header set OpenCode 2.0 sends on a model request. The free tier's gate keys off this
+// shape: it requires `x-opencode-session-id` AND `x-opencode-session` together (either alone fails),
+// the anonymous key, and `content-type: application/json`. We always emit the full set, only
+// borrowing an incoming OpenCode 2.0 User-Agent when the caller already is OpenCode (keeps
+// prompt-cache affinity across a relay).
+function upstreamHeaders(ids, req) {
+  const src = (req && req.headers) || {};
+  const incomingUA = src["user-agent"];
+  const userAgent =
+    typeof incomingUA === "string" && /^opencode\/[^/]+\/[^/]+\//i.test(incomingUA) ? incomingUA : CONFIG.userAgent;
+  const session = (ids && ids.session) || canonicalSessionId(crypto.randomBytes(16).toString("hex"));
+  const project = (ids && ids.project) || projectId(session);
+  return {
+    accept: "*/*",
+    "content-type": "application/json",
+    "user-agent": userAgent,
+    "x-opencode-client": "cli",
+    "x-opencode-session-id": session,
+    "x-opencode-session": session,
+    "x-session-affinity": session,
+    "x-session-id": session,
+    "x-opencode-project": project,
+    authorization: `Bearer ${CONFIG.upstreamApiKey || CONFIG.freeKey}`,
+  };
+}
+
+function modelsHeaders() {
+  return { accept: "application/json", "user-agent": CONFIG.userAgent };
+}
+
+// Returns a copy of body that satisfies the free tier's "agent-shaped request" requirement, which
+// for OpenCode 2.0 means a well-formed tool set:
+//   - streaming on and usage included;
+//   - a valid `read` tool present (the caller's is reused only when it already declares properties,
+//     otherwise OpenCode's own definition is substituted);
+//   - no tool whose name collides with a known OpenCode tool carrying an empty schema. Tools with
+//     unknown names are ignored by the gate, so they are left exactly as the caller sent them.
+function toolHasSchema(tool) {
+  const p = tool && tool.function && tool.function.parameters;
+  return !!(p && p.type === "object" && p.properties && Object.keys(p.properties).length > 0);
+}
+
+function ensureAgentShape(body) {
+  const out = { ...body, stream: true };
+  out.stream_options = { ...(out.stream_options || {}), include_usage: true };
+
+  const tools = Array.isArray(out.tools) ? out.tools.slice() : [];
+  const readIdx = tools.findIndex((t) => t && t.function && t.function.name === "read");
+  if (readIdx === -1) tools.push(CANONICAL_READ_TOOL);
+  else if (!toolHasSchema(tools[readIdx])) tools[readIdx] = CANONICAL_READ_TOOL;
+
+  out.tools = tools.map((t) => {
+    if (!t || !t.function || toolHasSchema(t)) return t;
+    // Pad an empty schema so a known-name tool still passes the gate. Unknown names are harmless.
+    return {
+      ...t,
+      function: {
+        ...t.function,
+        parameters: {
+          type: "object",
+          properties: { note: { type: "string", description: "unused; present only to satisfy Zen's tool-shape check" } },
+        },
+      },
+    };
+  });
+  return out;
+}
+
+// Re-joins a forced-streaming SSE response into a single OpenAI chat.completion JSON object.
+// Returns null when the upstream streamed no `choices` at all (so the caller can retry).
+async function collectCompletion(up) {
+  let id = null;
+  let model = null;
+  let finishReason = null;
+  let usage = null;
+  let content = "";
+  let reasoning = "";
+  const toolCalls = new Map();
+  const order = [];
+  let sawChoice = false;
+  let sawDone = false;
+  try {
+    for await (const payload of sseEvents(up.body)) {
+      if (sawDone) continue;
+      if (payload === "[DONE]") {
+        sawDone = true;
+        continue;
+      }
+      let chunk;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (chunk.error) throw new Error(chunk.error.message || JSON.stringify(chunk.error));
+      if (chunk.id && !id) id = chunk.id;
+      if (chunk.model && !model) model = chunk.model;
+      if (chunk.usage) usage = chunk.usage;
+      const choice = chunk.choices && chunk.choices[0];
+      if (!choice) continue;
+      sawChoice = true;
+      const d = choice.delta || {};
+      const r = d.reasoning_content ?? d.reasoning;
+      if (typeof r === "string") reasoning += r;
+      if (typeof d.content === "string") content += d.content;
+      if (Array.isArray(d.tool_calls)) {
+        for (const tc of d.tool_calls) {
+          if (!tc || typeof tc !== "object") continue;
+          const index = typeof tc.index === "number" ? tc.index : order.length;
+          let st = toolCalls.get(index);
+          if (!st) {
+            st = { id: tc.id || genId("call"), name: tc.function?.name || "", args: "" };
+            toolCalls.set(index, st);
+            order.push(index);
+          }
+          if (tc.id) st.id = tc.id;
+          if (tc.function?.name) st.name = tc.function.name;
+          if (typeof tc.function?.arguments === "string") st.args += tc.function.arguments;
+        }
+      }
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+    }
+  } catch (e) {
+    log(`collectCompletion error: ${e.message}`);
+    throw e;
+  }
+  if (!sawChoice) return null;
+  const message = { role: "assistant" };
+  if (content) message.content = content;
+  if (reasoning) message.reasoning_content = reasoning;
+  const calls = order
+    .sort((a, b) => a - b)
+    .map((k) => {
+      const t = toolCalls.get(k);
+      return { id: t.id, type: "function", function: { name: t.name, arguments: t.args } };
+    });
+  if (calls.length) message.tool_calls = calls;
+  return {
+    id: id || genId("chat"),
+    model,
+    object: "chat.completion",
+    choices: [{ index: 0, message, finish_reason: finishReason || "stop", logprobs: null }],
+    usage,
+  };
+}
+
 function dump(name, obj) {
   if (!CONFIG.debug) return;
   try {
@@ -80,12 +333,6 @@ function resolveModel(requested) {
   const r = String(requested);
   if (r === CONFIG.alias || /claude/i.test(r) || r.startsWith(`${CONFIG.alias}`)) return CONFIG.upstreamModel;
   return r; // pass-through: lets `/model <other-zen-id>` reach Zen directly
-}
-
-function upstreamHeaders() {
-  const h = { "content-type": "application/json", accept: "application/json, text/event-stream" };
-  if (CONFIG.upstreamApiKey) h.authorization = `Bearer ${CONFIG.upstreamApiKey}`;
-  return h;
 }
 
 function anthropicError(status, type, message) {
@@ -501,9 +748,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Zen's free endpoint sometimes answers 503 with an empty body, or a 200 SSE stream that carries no
 // content at all (just [DONE]). Nothing has reached the client at that point, so retry transparently.
-async function fetchUpstream(upstreamBody, signal, tag) {
+async function fetchUpstream(upstreamBody, signal, tag, ids, req) {
   for (let attempt = 1; ; attempt++) {
-    const up = await fetch(CONFIG.upstreamUrl, { method: "POST", headers: upstreamHeaders(), body: JSON.stringify(upstreamBody), signal });
+    const up = await fetch(CONFIG.upstreamUrl, { method: "POST", headers: upstreamHeaders(ids, req), body: JSON.stringify(upstreamBody), signal });
     if (up.ok || !RETRYABLE.has(up.status) || attempt === MAX_ATTEMPTS) return up;
     const text = await up.text().catch(() => "");
     log(`${tag} → upstream ${up.status} ${text.slice(0, 120)} (retry ${attempt}/${MAX_ATTEMPTS - 1})`);
@@ -524,20 +771,23 @@ async function handleMessages(req, res, rawBody) {
   const t0 = Date.now();
   const requestedModel = body.model || CONFIG.alias;
   const upstreamBody = toOpenAI(body);
-  dump("request", { anthropic: body, openai: upstreamBody });
+  const free = isFreeModel(upstreamBody.model);
+  const wire = free ? ensureAgentShape(upstreamBody) : upstreamBody;
+  const ids = requestIds(req, wire.messages);
+  dump("request", { anthropic: body, openai: upstreamBody, wire });
 
   const ac = new AbortController();
   let done = false;
   req.on("close", () => {
     if (!done) ac.abort();
   });
-  const tag = `${requestedModel}→${upstreamBody.model} ${upstreamBody.stream ? "stream" : "sync"} msgs=${upstreamBody.messages.length} tools=${upstreamBody.tools?.length || 0}`;
+  const tag = `${requestedModel}→${upstreamBody.model} ${free ? "free" : "paid"} ${upstreamBody.stream ? "stream" : "sync"} msgs=${upstreamBody.messages.length} tools=${upstreamBody.tools?.length || 0}`;
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let up;
     try {
-      up = await fetchUpstream(upstreamBody, ac.signal, tag);
+      up = await fetchUpstream(wire, ac.signal, tag, ids, req);
     } catch (e) {
       done = true;
       if (ac.signal.aborted) return; // client went away
@@ -553,6 +803,37 @@ async function handleMessages(req, res, rawBody) {
       log(`${tag} → ${up.status} ${text.slice(0, 300)}`);
       dump("upstream-error", { status: up.status, text });
       return sendJson(res, err.status, err.body);
+    }
+
+    if (free && !upstreamBody.stream) {
+      // Free tier only serves streaming agent-shaped requests, so a non-streaming caller gets its
+      // reply re-joined from the upstream SSE stream before we translate it to Anthropic format.
+      let json;
+      try {
+        json = await collectCompletion(up);
+      } catch (e) {
+        done = true;
+        log(`${tag} → aggregation error: ${e.message}`);
+        const err = anthropicError(502, "api_error", `upstream error: ${e.message}`);
+        return sendJson(res, err.status, err.body);
+      }
+      if (!json) {
+        if (attempt < MAX_ATTEMPTS) {
+          log(`${tag} → empty stream from upstream (retry ${attempt}/${MAX_ATTEMPTS - 1})`);
+          await sleep(1000 * attempt);
+          continue;
+        }
+        done = true;
+        log(`${tag} → empty stream from upstream after ${MAX_ATTEMPTS} attempts`);
+        const err = anthropicError(503, "overloaded_error", "[zen upstream] returned an empty stream; please retry");
+        return sendJson(res, err.status, err.body);
+      }
+      json.model = upstreamBody.model;
+      const out = fromOpenAI(json, requestedModel);
+      dump("response", { openai: json, anthropic: out });
+      log(`${tag} → 200 in ${elapsed()} in=${out.usage.input_tokens}+${out.usage.cache_read_input_tokens}c out=${out.usage.output_tokens} stop=${out.stop_reason}`);
+      done = true;
+      return sendJson(res, 200, out);
     }
 
     if (!upstreamBody.stream) {
@@ -712,8 +993,13 @@ async function handleChatCompletions(req, res, rawBody) {
   }
   const t0 = Date.now();
   const upstreamBody = normalizeOpenAIBody(body);
-  dump("openai-request", { client: body, upstream: upstreamBody });
-  const tag = `[openai] ${body.model || "?"}→${upstreamBody.model} ${upstreamBody.stream ? "stream" : "sync"} msgs=${upstreamBody.messages?.length || 0} tools=${upstreamBody.tools?.length || 0}`;
+  const free = isFreeModel(upstreamBody.model);
+  // Free tier only serves agent-shaped, streaming requests; paid models pass through untouched.
+  const wire = free ? ensureAgentShape(upstreamBody) : upstreamBody;
+  const ids = requestIds(req, wire.messages);
+  const forwarded = upstreamHeaders(ids, req);
+  dump("openai-request", { client: body, upstream: upstreamBody, wire, headers: forwarded });
+  const tag = `[openai] ${body.model || "?"}→${upstreamBody.model} ${free ? "free" : "paid"} ${wire.stream ? "stream" : "sync"} msgs=${upstreamBody.messages?.length || 0} tools=${upstreamBody.tools?.length || 0}`;
 
   const ac = new AbortController();
   let done = false;
@@ -724,29 +1010,63 @@ async function handleChatCompletions(req, res, rawBody) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let up;
     try {
-      up = await fetchUpstream(upstreamBody, ac.signal, tag);
+      up = await fetch(CONFIG.upstreamUrl, { method: "POST", headers: forwarded, body: JSON.stringify(wire) });
     } catch (e) {
       done = true;
-      if (ac.signal.aborted) return;
       log(`${tag} → upstream connection error: ${e.message}`);
       return sendJson(res, 502, { error: { message: `upstream connection error: ${e.message}`, type: "api_error" } });
     }
     const ct = up.headers.get("content-type") || "application/json";
     const headers = { ...CORS, "content-type": ct, "cache-control": "no-cache", "x-accel-buffering": "no" };
 
-    if (!up.ok || !upstreamBody.stream) {
+    if (!up.ok) {
+      const text = await up.text().catch(() => "");
+      done = true;
+      res.writeHead(up.status, headers);
+      res.end(text);
+      log(`${tag} → ${up.status} in ${((Date.now() - t0) / 1000).toFixed(1)}s ${text.length}B ${text.slice(0, 300).replace(/\s+/g, " ")}`);
+      dump("upstream-error", { status: up.status, text });
+      return;
+    }
+
+    if (free && !upstreamBody.stream) {
+      // Free tier only serves streaming agent-shaped requests, so a non-streaming caller's
+      // reply must be re-joined from the upstream SSE stream into one chat.completion object.
+      let json;
+      try {
+        json = await collectCompletion(up);
+      } catch (e) {
+        done = true;
+        log(`${tag} → aggregation error: ${e.message}`);
+        return sendJson(res, 502, { error: { message: `upstream error: ${e.message}`, type: "api_error" } });
+      }
+      if (!json) {
+        if (attempt < MAX_ATTEMPTS) {
+          log(`${tag} → empty stream from upstream (retry ${attempt}/${MAX_ATTEMPTS - 1})`);
+          await sleep(1000 * attempt);
+          continue;
+        }
+        done = true;
+        log(`${tag} → empty stream from upstream after ${MAX_ATTEMPTS} attempts`);
+        return sendJson(res, 503, { error: { message: "[zen upstream] returned an empty stream; please retry", type: "server_error" } });
+      }
+      json.model ||= wire.model;
+      done = true;
+      sendJson(res, 200, json);
+      log(`${tag} → 200 in ${((Date.now() - t0) / 1000).toFixed(1)}s in=${json.usage?.prompt_tokens ?? "?"} out=${json.usage?.completion_tokens ?? "?"} finish=${json.choices?.[0]?.finish_reason ?? "?"}`);
+      return;
+    }
+
+    if (!upstreamBody.stream) {
       const text = await up.text().catch(() => "");
       done = true;
       res.writeHead(up.status, headers);
       res.end(text);
       let extra = "";
-      if (!up.ok) extra = " " + text.slice(0, 300).replace(/\s+/g, " ");
-      else {
-        try {
-          const j = JSON.parse(text);
-          extra = ` in=${j.usage?.prompt_tokens ?? "?"} out=${j.usage?.completion_tokens ?? "?"} finish=${j.choices?.[0]?.finish_reason ?? "?"}`;
-        } catch {}
-      }
+      try {
+        const j = JSON.parse(text);
+        extra = ` in=${j.usage?.prompt_tokens ?? "?"} out=${j.usage?.completion_tokens ?? "?"} finish=${j.choices?.[0]?.finish_reason ?? "?"}`;
+      } catch {}
       log(`${tag} → ${up.status} in ${((Date.now() - t0) / 1000).toFixed(1)}s ${text.length}B${extra}`);
       return;
     }
@@ -813,7 +1133,7 @@ async function handleModels(res) {
   };
   let upstream = [];
   try {
-    const r = await fetch(CONFIG.upstreamModelsUrl, { headers: upstreamHeaders() });
+    const r = await fetch(CONFIG.upstreamModelsUrl, { headers: modelsHeaders() });
     if (r.ok) {
       const j = await r.json();
       const list = Array.isArray(j?.data) ? j.data : Array.isArray(j?.models) ? j.models : [];

@@ -1,7 +1,7 @@
 {
   "name": "zen-proxy",
   "version": "1.0.0",
-  "description": "Use OpenCode Zen's free models (Ox Alpha, Big Pickle, ...) from Claude Code and any OpenAI-compatible client, without an API key. Zero dependencies.",
+  "description": "Use OpenCode Zen's free models (Big Pickle, DeepSeek V4 Flash, ...) from Claude Code and any OpenAI-compatible client, without an API key. Zero dependencies.",
   "license": "MIT",
   "funding": "https://buymeacoffee.com/dawgog",
   "author": "Dhruvik Chauhan (https://github.com/Dalailalama)",

@@ -4,7 +4,7 @@ rem zen-proxy: start the local proxy for OpenCode Zen's free models (no API key 
 rem   zen-proxy          start it if it isn't already listening on 127.0.0.1:%PROXY_PORT%
 rem   zen-proxy stop     stop it
 rem Clients:
-rem   OpenAI-compatible : http://127.0.0.1:4040/v1   (any placeholder API key; model x-preview-f-free)
+rem   OpenAI-compatible : http://127.0.0.1:4040/v1   (any placeholder API key; model big-pickle)
 rem   Anthropic format  : http://127.0.0.1:4040      (model ox-alpha)  -- see claude-ox.cmd
 if "%PROXY_PORT%"=="" set PROXY_PORT=4040
 if "%ZEN_PROXY_JS%"=="" set ZEN_PROXY_JS=%~dp0..\proxy.js
@@ -30,4 +30,4 @@ for /l %%i in (1,1,20) do (
 echo [zen-proxy] did not come up - check the "zen-proxy (Ox Alpha)" window for errors.
 exit /b 1
 :ready
-echo [zen-proxy] ready: OpenAI-compatible base URL http://127.0.0.1:%PROXY_PORT%/v1  (model x-preview-f-free)
+echo [zen-proxy] ready: OpenAI-compatible base URL http://127.0.0.1:%PROXY_PORT%/v1  (model big-pickle)

@@ -3,7 +3,7 @@
 #   zen-proxy.sh          start it if nothing is listening on 127.0.0.1:$PROXY_PORT
 #   zen-proxy.sh stop     stop it
 # Clients:
-#   OpenAI-compatible : http://127.0.0.1:4040/v1   (any placeholder API key; model x-preview-f-free)
+#   OpenAI-compatible : http://127.0.0.1:4040/v1   (any placeholder API key; model big-pickle)
 #   Anthropic format  : http://127.0.0.1:4040      (model ox-alpha)  -- see claude-ox.sh
 PROXY_PORT="${PROXY_PORT:-4040}"
 ZEN_PROXY_JS="${ZEN_PROXY_JS:-$(cd "$(dirname "$0")/.." && pwd)/proxy.js}"
@@ -23,7 +23,7 @@ nohup node "$ZEN_PROXY_JS" >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 i=0
 while [ $i -lt 40 ]; do
-  if listening; then echo "[zen-proxy] ready: OpenAI-compatible base URL http://127.0.0.1:$PROXY_PORT/v1  (model x-preview-f-free)"; exit 0; fi
+  if listening; then echo "[zen-proxy] ready: OpenAI-compatible base URL http://127.0.0.1:$PROXY_PORT/v1  (model big-pickle)"; exit 0; fi
   i=$((i+1)); sleep 0.5
 done
 echo "[zen-proxy] did not come up - see $LOG"; exit 1
