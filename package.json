@@ -7,10 +7,10 @@
   "author": "Dhruvik Chauhan (https://github.com/Dalailalama)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Dalailalama/zen-proxy.git"
+    "url": "git+https://github.com/TheHiddenDeveloper/zen-proxy.git"
   },
-  "homepage": "https://github.com/Dalailalama/zen-proxy#readme",
-  "bugs": "https://github.com/Dalailalama/zen-proxy/issues",
+  "homepage": "https://github.com/TheHiddenDeveloper/zen-proxy#readme",
+  "bugs": "https://github.com/TheHiddenDeveloper/zen-proxy/issues",
   "keywords": [
     "opencode",
     "zen",

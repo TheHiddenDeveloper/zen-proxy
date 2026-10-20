@@ -2,7 +2,7 @@
 "use strict";
 /**
  * zen-proxy — use OpenCode Zen's free models (Big Pickle, MiMo-V2.5, ...) from Claude Code and
- * any OpenAI-compatible client, without an API key.   https://github.com/Dalailalama/zen-proxy
+ * any OpenAI-compatible client, without an API key.   https://github.com/TheHiddenDeveloper/zen-proxy
  *
  *   Claude Code  --Anthropic Messages API-->  this proxy  --OpenAI chat/completions-->  Zen
  *   OpenAI-style client  --chat/completions-->  this proxy  --(auth header stripped)-->  Zen

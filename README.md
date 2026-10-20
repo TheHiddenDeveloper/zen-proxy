@@ -55,7 +55,7 @@ There are **no dependencies**, so there is no `npm install` step. The whole prox
 ### 1. Get the code
 
 ```bash
-git clone https://github.com/Dalailalama/zen-proxy
+git clone https://github.com/TheHiddenDeveloper/zen-proxy
 cd zen-proxy
 ```
 
