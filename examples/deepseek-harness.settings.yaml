@@ -64,3 +64,71 @@ llm-pi-ai:
           name: Nemotron 3.5 Lightning Free
           contextWindow: 200000
           maxTokens: 32000
+    # Claude Pro/Max subscription, served by zen-proxy's Anthropic passthrough. Requires plain
+    # `claude` to be signed in (~/.claude/.credentials.json); zen-proxy refreshes that session.
+    # pi-ai appends /v1/messages to baseURL, so baseURL must NOT include /v1.
+    claude:
+      displayName: Claude Pro (via zen-proxy)
+      api: anthropic-messages
+      baseURL: http://127.0.0.1:4040
+      headers:
+        Authorization: Bearer zen-proxy-placeholder
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 128000
+      models:
+        - id: claude-opus-5-5
+          name: Claude Opus 5.5
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-sonnet-5-5
+          name: Claude Sonnet 5.5
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-haiku-5-5
+          name: Claude Haiku 5.5
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-fable-5-1
+          name: Claude Fable 5.1
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-opus-5
+          name: Claude Opus 5
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-sonnet-5
+          name: Claude Sonnet 5
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-fable-5
+          name: Claude Fable 5
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-opus-4-8
+          name: Claude Opus 4.8
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-opus-4-7
+          name: Claude Opus 4.7
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-sonnet-4-6
+          name: Claude Sonnet 4.6
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-opus-4-6
+          name: Claude Opus 4.6
+          contextWindow: 1000000
+          maxTokens: 128000
+        - id: claude-opus-4-5-20251101
+          name: Claude Opus 4.5
+          contextWindow: 200000
+          maxTokens: 64000
+        - id: claude-haiku-4-5-20251001
+          name: Claude Haiku 4.5
+          contextWindow: 200000
+          maxTokens: 64000
+        - id: claude-sonnet-4-5-20250929
+          name: Claude Sonnet 4.5
+          contextWindow: 200000
+          maxTokens: 64000

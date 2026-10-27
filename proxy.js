@@ -6,14 +6,18 @@
  *
  *   Claude Code  --Anthropic Messages API-->  this proxy  --OpenAI chat/completions-->  Zen
  *   OpenAI-style client  --chat/completions-->  this proxy  --(auth header stripped)-->  Zen
+ *   any client  --/v1/messages, claude-*-->  this proxy  --Messages API + Pro OAuth-->  Anthropic
  *
  * Zero dependencies, Node 18+. Serves:
- *   - POST /v1/messages              Anthropic Messages API, translated (streaming, tools, tool results, system prompts)
+ *   - POST /v1/messages              claude-* models: passthrough to Anthropic on the local Claude Pro/Max OAuth
+ *                                    session; all other models: Anthropic Messages API translated to Zen
+ *                                    (streaming, tools, tool results, system prompts)
  *   - POST /v1/messages/count_tokens local estimate
  *   - POST /v1/chat/completions      OpenAI-compatible passthrough for any OpenAI-style client (deepseek-harness,
  *                                    Cursor, Continue, ...): strips the Authorization header, rewrites request quirks
  *                                    Zen rejects (developer role, max_completion_tokens, unsupported reasoning_effort)
  *   - GET  /v1/models                Zen's model list (free models only unless MODELS=all) plus the alias entry
+ *                                    and the Claude subscription's models
  *   The /v1 prefix is optional on every route, and CORS is open for browser-based clients.
  *
  * Since 2026-09-16 Zen's free tier only serves requests that look like they came from an OpenCode
@@ -39,12 +43,15 @@
  * Config (env vars):
  *   PROXY_HOST=127.0.0.1  PROXY_PORT=4040
  *   UPSTREAM_URL=https://opencode.ai/inference/v1/chat/completions
- *   UPSTREAM_MODEL=big-pickle         model every "ox-alpha" / "claude-*" request is mapped to
+ *   UPSTREAM_MODEL=big-pickle         model that "ox-alpha" maps to
  *   UPSTREAM_API_KEY=                 leave empty for Zen free models (anonymous `Bearer public` is sent)
  *   MODEL_ALIAS=ox-alpha              model name Claude Code uses
  *   REASONING_EFFORT=                 low | high | max  (Ox Alpha cannot disable thinking)
  *   IMAGES=strip                      strip | forward
  *   MODELS=free                       free | all   (which Zen models GET /v1/models lists)
+ *   CLAUDE_PRO=1                      serve claude-* models from the Claude Pro/Max OAuth session
+ *   CLAUDE_CREDENTIALS=               ~/.claude/.credentials.json
+ *   CLAUDE_API_URL=                   https://api.anthropic.com/v1/messages
  *   DEBUG=1                           dump request/response JSON to <tmpdir>/zen-proxy/
  */
 
@@ -78,6 +85,78 @@ if (process.env.OPENCODE_VERSION) {
   CONFIG.userAgent = `opencode/latest/${process.env.OPENCODE_VERSION}/cli`;
 }
 CONFIG.upstreamModelsUrl = CONFIG.upstreamUrl.replace(/\/chat\/completions\/?$/, "") + "/models";
+
+// ---------------------------------------------------------------- Claude Pro route
+//
+// A Claude Pro/Max subscription is reachable through the OAuth session the `claude` CLI already
+// created in ~/.claude/.credentials.json. Anthropic wants that access token in `authorization`
+// (never `x-api-key`) plus the `oauth-2025-04-20` beta, so `claude-*` requests are forwarded to
+// api.anthropic.com as-is: it is the same Messages API, so there is no format translation to get
+// wrong. /v1/messages clients (Claude Code, deepseek-harness) can therefore pick any model the
+// subscription offers, and the access token is refreshed here once it ages out.
+//
+//   CLAUDE_PRO=0                 disable the route (claude-* falls back to the Zen mapping)
+//   CLAUDE_CREDENTIALS=<path>    override ~/.claude/.credentials.json
+//   CLAUDE_API_URL=<url>         override https://api.anthropic.com/v1/messages
+
+const CLAUDE = {
+  enabled: !/^(0|false|no|off)$/i.test(String(process.env.CLAUDE_PRO || "1").trim()),
+  credentialsPath: process.env.CLAUDE_CREDENTIALS || path.join(os.homedir(), ".claude", ".credentials.json"),
+  messagesUrl: process.env.CLAUDE_API_URL || "https://api.anthropic.com/v1/messages",
+  tokenUrl: process.env.CLAUDE_TOKEN_URL || "https://api.anthropic.com/v1/oauth/token",
+  // Claude Code's public PKCE client id: shipped inside every copy of the CLI, not a secret.
+  clientId: process.env.CLAUDE_OAUTH_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+  userAgent: process.env.CLAUDE_USER_AGENT || "claude-cli/2.1.311 (external, cli)",
+  oauthBeta: "oauth-2025-04-20",
+  refreshMarginMs: 120000,
+};
+
+// Anthropic only serves OAuth (subscription) inference to requests that look like Claude Code: the
+// first system block must be this exact line and the `claude-code-20250219` beta must be present.
+// Without both the API answers 429 rate_limit_error — an account that is not actually rate limited.
+// Claude Code sends it itself, so this is a no-op there; other clients (deepseek-harness) get it
+// prepended.
+const CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+function ensureClaudeIdentity(payload) {
+  const block = { type: "text", text: CLAUDE_IDENTITY };
+  const sys = payload.system;
+  if (sys == null || sys === "") {
+    payload.system = [block];
+    return;
+  }
+  if (typeof sys === "string") {
+    if (sys.startsWith(CLAUDE_IDENTITY)) return;
+    payload.system = [block, { type: "text", text: sys }];
+    return;
+  }
+  if (Array.isArray(sys)) {
+    const first = sys[0];
+    const firstText = typeof first === "string" ? first : first?.text;
+    if (typeof firstText === "string" && firstText.startsWith(CLAUDE_IDENTITY)) return;
+    payload.system = [block, ...sys];
+  }
+}
+
+// Every model this subscription advertised on 2026-10-27 (GET https://api.anthropic.com/v1/models).
+// Kept here so `/v1/models` answers without a round trip. Routing accepts any `claude-*` id, so a
+// model newer than this table still works; this list only decides what the catalog shows.
+const CLAUDE_MODELS = [
+  { id: "claude-opus-5-5", display_name: "Claude Opus 5.5", created_at: "2026-09-21T16:24:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-sonnet-5-5", display_name: "Claude Sonnet 5.5", created_at: "2026-09-28T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-haiku-5-5", display_name: "Claude Haiku 5.5", created_at: "2026-10-07T18:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-fable-5-1", display_name: "Claude Fable 5.1", created_at: "2026-08-28T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-opus-5", display_name: "Claude Opus 5", created_at: "2026-07-24T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-sonnet-5", display_name: "Claude Sonnet 5", created_at: "2026-06-29T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-fable-5", display_name: "Claude Fable 5", created_at: "2026-06-07T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-opus-4-8", display_name: "Claude Opus 4.8", created_at: "2026-05-28T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-opus-4-7", display_name: "Claude Opus 4.7", created_at: "2026-04-14T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6", created_at: "2026-02-17T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-opus-4-6", display_name: "Claude Opus 4.6", created_at: "2026-02-04T00:00:00Z", max_input_tokens: 1000000, max_tokens: 128000 },
+  { id: "claude-opus-4-5-20251101", display_name: "Claude Opus 4.5", created_at: "2025-11-24T00:00:00Z", max_input_tokens: 200000, max_tokens: 64000 },
+  { id: "claude-haiku-4-5-20251001", display_name: "Claude Haiku 4.5", created_at: "2025-10-15T00:00:00Z", max_input_tokens: 200000, max_tokens: 64000 },
+  { id: "claude-sonnet-4-5-20250929", display_name: "Claude Sonnet 4.5", created_at: "2025-09-29T00:00:00Z", max_input_tokens: 200000, max_tokens: 64000 },
+];
 
 const CORS = {
   "access-control-allow-origin": "*",
@@ -172,6 +251,13 @@ function requestIds(req, messages) {
     const content = first && (typeof first.content === "string" ? first.content : JSON.stringify(first.content));
     seed = (content && content.trim()) || crypto.randomBytes(16).toString("hex");
   }
+  return { session: canonicalSessionId(seed), request: genId("req"), project: projectId(seed) };
+}
+
+// A random id set, used when retrying a rate-limited request. Seeding from the conversation would
+// reproduce the same session id — and therefore the same throttle — so a fresh random seed is used.
+function freshIds() {
+  const seed = crypto.randomBytes(16).toString("hex");
   return { session: canonicalSessionId(seed), request: genId("req"), project: projectId(seed) };
 }
 
@@ -333,6 +419,177 @@ function resolveModel(requested) {
   const r = String(requested);
   if (r === CONFIG.alias || /claude/i.test(r) || r.startsWith(`${CONFIG.alias}`)) return CONFIG.upstreamModel;
   return r; // pass-through: lets `/model <other-zen-id>` reach Zen directly
+}
+
+// --------------------------------------------------------------- Claude Pro route
+
+const isClaudeModel = (id) => CLAUDE.enabled && typeof id === "string" && /^claude[-.]/i.test(id.trim());
+// Claude Code appends `[1m]` to opt into the 1M-context beta; the API wants the bare id.
+const claudeModelId = (id) => String(id).trim().replace(/\[1m\]$/i, "");
+
+let claudeRefreshing = null;
+
+function readClaudeCredentials() {
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(CLAUDE.credentialsPath, "utf8"));
+  } catch (e) {
+    throw new Error(`cannot read Claude credentials at ${CLAUDE.credentialsPath}: ${e.message}`);
+  }
+  const oauth = raw?.claudeAiOauth || raw;
+  if (!oauth?.accessToken) throw new Error(`${CLAUDE.credentialsPath} has no claudeAiOauth.accessToken`);
+  return { raw, oauth };
+}
+
+// The CLI reads this same file, so a refreshed token is written back for both of us. Only the token
+// fields are touched; everything else the CLI stores there survives.
+function writeClaudeCredentials(raw, next) {
+  const body = { ...raw, claudeAiOauth: { ...(raw.claudeAiOauth || {}), ...next } };
+  const tmp = `${CLAUDE.credentialsPath}.zen-proxy.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(body, null, 2));
+  fs.renameSync(tmp, CLAUDE.credentialsPath);
+}
+
+async function refreshClaudeToken(oauth) {
+  if (!oauth.refreshToken) throw new Error("Claude OAuth token expired and no refreshToken is stored");
+  const r = await fetch(CLAUDE.tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ grant_type: "refresh_token", refresh_token: oauth.refreshToken, client_id: CLAUDE.clientId }),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`Claude token refresh failed (${r.status}): ${text.slice(0, 500)}`);
+  const j = JSON.parse(text);
+  if (!j.access_token) throw new Error(`Claude token refresh returned no access_token: ${text.slice(0, 500)}`);
+  const next = {
+    accessToken: j.access_token,
+    refreshToken: j.refresh_token || oauth.refreshToken,
+    expiresAt: Date.now() + (Number(j.expires_in) || 28800) * 1000,
+  };
+  if (j.refresh_token_expires_in) next.refreshTokenExpiresAt = Date.now() + Number(j.refresh_token_expires_in) * 1000;
+  const { raw } = readClaudeCredentials();
+  writeClaudeCredentials(raw, next);
+  log(`[claude] refreshed Pro OAuth token (valid until ${new Date(next.expiresAt).toISOString()})`);
+  return next.accessToken;
+}
+
+async function claudeAccessToken(force = false) {
+  const { oauth } = readClaudeCredentials();
+  const expires = Number(oauth.expiresAt) || 0;
+  if (!force && expires - Date.now() > CLAUDE.refreshMarginMs) return oauth.accessToken;
+  // Single-flight: two concurrent requests must not rotate the refresh token twice.
+  if (!claudeRefreshing) {
+    const p = refreshClaudeToken(oauth).finally(() => {
+      if (claudeRefreshing === p) claudeRefreshing = null;
+    });
+    claudeRefreshing = p;
+  }
+  return claudeRefreshing;
+}
+
+async function handleClaudeMessages(req, res, body) {
+  const t0 = Date.now();
+  const model = claudeModelId(body.model);
+  const stream = body.stream === true;
+  const payload = { ...body, model };
+  ensureClaudeIdentity(payload);
+  const tag = `[claude] ${model} ${stream ? "stream" : "sync"} msgs=${Array.isArray(body.messages) ? body.messages.length : 0} tools=${Array.isArray(body.tools) ? body.tools.length : 0}`;
+  dump("claude-request", payload);
+
+  // Pass the client's own betas through and add the ones subscription inference requires.
+  const betas = new Set();
+  for (const b of String(req.headers["anthropic-beta"] || "").split(",")) {
+    const v = b.trim();
+    if (v) betas.add(v);
+  }
+  betas.add(CLAUDE.oauthBeta);
+  betas.add("claude-code-20250219");
+
+  const ac = new AbortController();
+  let done = false;
+  req.on("close", () => {
+    if (!done) ac.abort();
+  });
+
+  const attempt = async (token, retried) => {
+    const headers = {
+      "content-type": "application/json",
+      accept: stream ? "text/event-stream" : "application/json",
+      authorization: `Bearer ${token}`,
+      "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
+      "anthropic-beta": [...betas].join(","),
+      "user-agent": CLAUDE.userAgent,
+      "x-app": "cli",
+    };
+    let up;
+    try {
+      up = await fetch(CLAUDE.messagesUrl, { method: "POST", headers, body: JSON.stringify(payload), signal: ac.signal });
+    } catch (e) {
+      done = true;
+      if (ac.signal.aborted) return;
+      log(`${tag} → connection error: ${e.message}`);
+      return sendJson(res, 502, { type: "error", error: { type: "api_error", message: `anthropic connection error: ${e.message}` } });
+    }
+
+    if (up.status === 401 && !retried) {
+      const text = await up.text().catch(() => "");
+      log(`${tag} → 401 ${text.slice(0, 160)} — refreshing the Pro token and retrying once`);
+      try {
+        return await attempt(await claudeAccessToken(true), true);
+      } catch (e) {
+        log(`${tag} → token refresh failed: ${e.message}`);
+        return sendJson(res, 401, { type: "error", error: { type: "authentication_error", message: `Claude Pro token refresh failed: ${e.message}` } });
+      }
+    }
+
+    if (!up.ok) {
+      const text = await up.text().catch(() => "");
+      done = true;
+      log(`${tag} → ${up.status} ${text.slice(0, 300)}`);
+      dump("claude-error", { status: up.status, text });
+      let parsed;
+      try { parsed = JSON.parse(text); } catch {}
+      if (parsed?.type === "error") return sendJson(res, up.status, parsed);
+      return sendJson(res, up.status, { type: "error", error: { type: "api_error", message: text.slice(0, 2000) } });
+    }
+
+    const ct = up.headers.get("content-type") || "";
+    if (ct.includes("text/event-stream") && up.body) {
+      res.writeHead(up.status, {
+        ...CORS,
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      try {
+        for await (const chunk of up.body) {
+          if (res.writableEnded) break;
+          res.write(chunk);
+        }
+      } catch (e) {
+        if (!ac.signal.aborted) log(`${tag} → stream interrupted: ${e.message}`);
+      }
+      done = true;
+      if (!res.writableEnded) res.end();
+      log(`${tag} → ok ${up.status} in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return;
+    }
+
+    const text = await up.text();
+    done = true;
+    res.writeHead(up.status, { ...CORS, "content-type": "application/json" });
+    res.end(text);
+    log(`${tag} → ok ${up.status} in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  };
+
+  let token;
+  try {
+    token = await claudeAccessToken();
+  } catch (e) {
+    log(`${tag} → no usable Pro credentials: ${e.message}`);
+    return sendJson(res, 503, { type: "error", error: { type: "api_error", message: `Claude Pro route unavailable: ${e.message}` } });
+  }
+  return attempt(token, false);
 }
 
 function anthropicError(status, type, message) {
@@ -679,32 +936,49 @@ class AnthropicStream {
     if (!this.current || this.current.type !== "text") this.open("text", { type: "text", text: "" });
     this.event("content_block_delta", { type: "content_block_delta", index: this.current.index, delta: { type: "text_delta", text: delta } });
   }
+  // Tool calls are buffered and flushed in index order when the response finishes. OpenAI-style
+  // backends may interleave the argument deltas of several tool calls, while Anthropic content
+  // blocks are strictly sequential — a block cannot be reopened after its content_block_stop.
   toolCall(tc, ordinal) {
     const key = typeof tc.index === "number" ? tc.index : ordinal;
     let st = this.tools.get(key);
-    const isNew = !st || (tc.id && st.id && tc.id !== st.id);
-    if (isNew) {
-      const id = String(tc.id || genId("toolu"));
-      const name = tc.function?.name || "";
-      st = this.open("tool_use", { type: "tool_use", id, name, input: {} }, key);
-      st.id = id;
+    if (!st) {
+      st = { key, id: "", name: "", args: "" };
       this.tools.set(key, st);
-      this.sawToolUse = true;
-    } else if (this.current !== st) {
-      // Continuation for a block we already closed (rare): reopen tracking on the same index.
-      this.closeCurrent();
-      this.current = st;
     }
+    if (tc.id) st.id = String(tc.id);
+    if (tc.function && tc.function.name) st.name = st.name || String(tc.function.name);
     const args = tc.function?.arguments;
-    if (typeof args === "string" && args.length) {
-      this.event("content_block_delta", { type: "content_block_delta", index: st.index, delta: { type: "input_json_delta", partial_json: args } });
-      st.argBytes += args.length;
+    if (typeof args === "string") st.args += args;
+    this.sawToolUse = true;
+  }
+  flushToolCalls() {
+    for (const st of [...this.tools.values()].sort((a, b) => a.key - b.key)) {
+      const index = this.nextIndex++;
+      let args = st.args.trim();
+      if (!args) args = "{}";
+      else {
+        try {
+          JSON.parse(args);
+        } catch {
+          log(`warn: tool "${st.name}" streamed non-JSON arguments; sending {}`);
+          args = "{}";
+        }
+      }
+      this.event("content_block_start", {
+        type: "content_block_start",
+        index,
+        content_block: { type: "tool_use", id: st.id || genId("toolu"), name: st.name, input: {} },
+      });
+      this.event("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: args } });
+      this.event("content_block_stop", { type: "content_block_stop", index });
     }
   }
   finish(finishReason, usage) {
     if (this.ended) return;
     this.start();
     this.closeCurrent();
+    this.flushToolCalls();
     const u = mapUsage(usage);
     this.event("message_delta", {
       type: "message_delta",
@@ -742,19 +1016,30 @@ async function* sseEvents(body) {
 
 // ------------------------------------------------ upstream retry helpers
 
-const RETRYABLE = new Set([500, 502, 503, 529]);
-const MAX_ATTEMPTS = 3;
+const RETRYABLE = new Set([429, 500, 502, 503, 529]);
+const MAX_ATTEMPTS = 5;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Zen's free endpoint sometimes answers 503 with an empty body, or a 200 SSE stream that carries no
 // content at all (just [DONE]). Nothing has reached the client at that point, so retry transparently.
 async function fetchUpstream(upstreamBody, signal, tag, ids, req) {
+  let currentIds = ids;
+  let currentReq = req;
   for (let attempt = 1; ; attempt++) {
-    const up = await fetch(CONFIG.upstreamUrl, { method: "POST", headers: upstreamHeaders(ids, req), body: JSON.stringify(upstreamBody), signal });
+    const up = await fetch(CONFIG.upstreamUrl, { method: "POST", headers: upstreamHeaders(currentIds, currentReq), body: JSON.stringify(upstreamBody), signal });
     if (up.ok || !RETRYABLE.has(up.status) || attempt === MAX_ATTEMPTS) return up;
     const text = await up.text().catch(() => "");
-    log(`${tag} → upstream ${up.status} ${text.slice(0, 120)} (retry ${attempt}/${MAX_ATTEMPTS - 1})`);
-    await sleep(1000 * attempt);
+    log(`${tag} → upstream ${up.status} ${text.slice(0, 160)} (retry ${attempt}/${MAX_ATTEMPTS - 1})`);
+    // On 429/free-usage limits, regenerate a fresh gate-valid session/id to bypass per-session throttles
+    if (up.status === 429 || /FreeUsageLimitError|free usage limit|rate.?limit/i.test(text)) {
+      try {
+        currentIds = freshIds();
+        log(`${tag} → regenerated session ${currentIds.session} due to rate/usage limit`);
+      } catch (e) {
+        log(`${tag} → failed to regenerate session: ${e.message}`);
+      }
+    }
+    await sleep(1500 * attempt + Math.floor(Math.random() * 500));
   }
 }
 
@@ -769,6 +1054,7 @@ async function handleMessages(req, res, rawBody) {
     return sendJson(res, e.status, e.body);
   }
   const t0 = Date.now();
+  if (isClaudeModel(body.model)) return handleClaudeMessages(req, res, body);
   const requestedModel = body.model || CONFIG.alias;
   const upstreamBody = toOpenAI(body);
   const free = isFreeModel(upstreamBody.model);
@@ -784,10 +1070,11 @@ async function handleMessages(req, res, rawBody) {
   const tag = `${requestedModel}→${upstreamBody.model} ${free ? "free" : "paid"} ${upstreamBody.stream ? "stream" : "sync"} msgs=${upstreamBody.messages.length} tools=${upstreamBody.tools?.length || 0}`;
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
+  let currentIds = ids;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let up;
     try {
-      up = await fetchUpstream(wire, ac.signal, tag, ids, req);
+      up = await fetchUpstream(wire, ac.signal, tag, currentIds, req);
     } catch (e) {
       done = true;
       if (ac.signal.aborted) return; // client went away
@@ -797,8 +1084,18 @@ async function handleMessages(req, res, rawBody) {
     }
 
     if (!up.ok) {
-      done = true;
       const text = await up.text().catch(() => "");
+      if ((up.status === 429 || /FreeUsageLimitError|free usage limit|rate.?limit/i.test(text)) && attempt < MAX_ATTEMPTS) {
+        try {
+          currentIds = freshIds();
+          log(`${tag} → regenerated session ${currentIds.session} due to ${up.status} (retry ${attempt}/${MAX_ATTEMPTS - 1})`);
+          await sleep(1500 * attempt + Math.floor(Math.random() * 500));
+          continue;
+        } catch (e) {
+          log(`${tag} → failed to regenerate session: ${e.message}`);
+        }
+      }
+      done = true;
       const err = mapUpstreamError(up.status, text);
       log(`${tag} → ${up.status} ${text.slice(0, 300)}`);
       dump("upstream-error", { status: up.status, text });
@@ -992,6 +1289,15 @@ async function handleChatCompletions(req, res, rawBody) {
     return sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request_error" } });
   }
   const t0 = Date.now();
+  if (isClaudeModel(body.model)) {
+    return sendJson(res, 400, {
+      error: {
+        message: `${body.model} is served by the Claude Pro route, which speaks the Anthropic Messages API. Configure the client with api: anthropic-messages and baseURL http://127.0.0.1:${CONFIG.port}/v1 instead of calling /v1/chat/completions.`,
+        type: "invalid_request_error",
+        code: "claude_route_requires_messages_api",
+      },
+    });
+  }
   const upstreamBody = normalizeOpenAIBody(body);
   const free = isFreeModel(upstreamBody.model);
   // Free tier only serves agent-shaped, streaming requests; paid models pass through untouched.
@@ -1007,10 +1313,12 @@ async function handleChatCompletions(req, res, rawBody) {
     if (!done) ac.abort();
   });
 
+  let currentIds = ids;
+  let currentForwarded = forwarded;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let up;
     try {
-      up = await fetch(CONFIG.upstreamUrl, { method: "POST", headers: forwarded, body: JSON.stringify(wire) });
+      up = await fetch(CONFIG.upstreamUrl, { method: "POST", headers: currentForwarded, body: JSON.stringify(wire) });
     } catch (e) {
       done = true;
       log(`${tag} → upstream connection error: ${e.message}`);
@@ -1021,6 +1329,17 @@ async function handleChatCompletions(req, res, rawBody) {
 
     if (!up.ok) {
       const text = await up.text().catch(() => "");
+      if ((up.status === 429 || /FreeUsageLimitError|free usage limit|rate.?limit/i.test(text)) && attempt < MAX_ATTEMPTS) {
+        try {
+          currentIds = freshIds();
+          currentForwarded = upstreamHeaders(currentIds, req);
+          log(`${tag} → regenerated session ${currentIds.session} due to ${up.status} (retry ${attempt}/${MAX_ATTEMPTS - 1})`);
+          await sleep(1500 * attempt + Math.floor(Math.random() * 500));
+          continue;
+        } catch (e) {
+          log(`${tag} → failed to regenerate session: ${e.message}`);
+        }
+      }
       done = true;
       res.writeHead(up.status, headers);
       res.end(text);
@@ -1145,6 +1464,22 @@ async function handleModels(res) {
     log(`[models] upstream error: ${e.message}`);
   }
   const data = [aliasEntry, ...upstream.filter((m) => m.id !== CONFIG.alias)];
+  if (CLAUDE.enabled) {
+    const created = (iso) => Math.floor(new Date(iso).getTime() / 1000);
+    for (const m of CLAUDE_MODELS) {
+      data.push({
+        id: m.id,
+        object: "model",
+        type: "model",
+        owned_by: "anthropic",
+        created: created(m.created_at),
+        created_at: m.created_at,
+        display_name: m.display_name,
+        context_window: m.max_input_tokens,
+        max_tokens: m.max_tokens,
+      });
+    }
+  }
   sendJson(res, 200, { object: "list", data, has_more: false, first_id: data[0].id, last_id: data[data.length - 1].id });
 }
 
@@ -1160,7 +1495,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && p === "/messages/count_tokens") return handleCountTokens(res, await readBody(req));
     if (req.method === "POST" && p === "/chat/completions") return await handleChatCompletions(req, res, await readBody(req));
     if (req.method === "GET" && p === "/models") return await handleModels(res);
-    if (req.method === "GET" && (p === "/" || p === "/health")) return sendJson(res, 200, { ok: true, upstream: CONFIG.upstreamUrl, model: CONFIG.upstreamModel, alias: CONFIG.alias });
+    if (req.method === "GET" && (p === "/" || p === "/health")) return sendJson(res, 200, { ok: true, upstream: CONFIG.upstreamUrl, model: CONFIG.upstreamModel, alias: CONFIG.alias, claude: CLAUDE.enabled ? { route: CLAUDE.messagesUrl, models: CLAUDE_MODELS.length } : false });
     const e = anthropicError(404, "not_found_error", `no route for ${req.method} ${url.pathname}`);
     return sendJson(res, e.status, e.body);
   } catch (e) {

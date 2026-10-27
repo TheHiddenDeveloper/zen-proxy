@@ -72,9 +72,9 @@ const TOOLS = [
 }
 
 {
-  const s = await stream({ model: "claude-sonnet-5", max_tokens: 64, system: "Be terse.", messages: [{ role: "user", content: "Reply with exactly: pong" }] });
+  const s = await stream({ model: "ox-alpha", max_tokens: 64, system: "Be terse.", messages: [{ role: "user", content: "Reply with exactly: pong" }] });
   const text = s.blocks.find((b) => b?.type === "text")?.text;
-  ok(s.status === 200 && text?.trim() === "pong", "stream text (claude-* id mapped to upstream model)", `text=${JSON.stringify(text)} stop=${s.stop}`);
+  ok(s.status === 200 && text?.trim() === "pong", "stream text", `text=${JSON.stringify(text)} stop=${s.stop}`);
   ok(s.types[0] === "message_start" && s.types.at(-1) === "message_stop", "stream event framing", s.types.filter((t, i, a) => a.indexOf(t) === i).join(","));
   ok(s.usage && s.usage.output_tokens > 0 && s.usage.input_tokens + s.usage.cache_read_input_tokens > 0, "stream usage populated in message_delta", JSON.stringify(s.usage));
 }
@@ -116,6 +116,29 @@ let toolUse;
 {
   const { status, json } = await msg({ model: "definitely-not-a-model", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
   ok(status === 400 && json?.error?.type === "invalid_request_error", "unknown model → 400 invalid_request_error", `status=${status} ${JSON.stringify(json?.error).slice(0, 160)}`);
+}
+
+{
+  const r = await fetch(`${BASE}/v1/models`);
+  const j = await r.json();
+  const ids = (j?.data || []).map((m) => m.id);
+  ok(r.status === 200 && ids.includes("claude-opus-5-5") && ids.includes("ox-alpha"), "GET /v1/models lists the Claude Pro catalogue", `${ids.filter((id) => id.startsWith("claude-")).length} claude ids`);
+}
+
+{
+  // claude-* is not servable over chat/completions; the error must say what to do instead.
+  const r = await fetch(`${BASE}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", Authorization: "Bearer x" }, body: JSON.stringify({ model: "claude-haiku-5-5", messages: [{ role: "user", content: "hi" }] }) });
+  const j = await r.json().catch(() => null);
+  ok(r.status === 400 && j?.error?.code === "claude_route_requires_messages_api", "claude-* on /v1/chat/completions → 400 with guidance", `status=${r.status} code=${j?.error?.code}`);
+}
+
+if (process.env.ZEN_PROXY_TEST_CLAUDE === "1") {
+  // Live subscription test: needs a signed-in ~/.claude/.credentials.json and spends Pro quota.
+  const { status, json } = await msg({ model: "claude-haiku-5-5", max_tokens: 32, messages: [{ role: "user", content: "Reply with exactly: pro-ok" }] });
+  const text = json?.content?.find((b) => b.type === "text")?.text;
+  ok(status === 200 && text?.trim() === "pro-ok", "Claude Pro passthrough (ZEN_PROXY_TEST_CLAUDE=1)", `status=${status} text=${JSON.stringify(text)}`);
+} else {
+  console.log("skip  Claude Pro passthrough live test (set ZEN_PROXY_TEST_CLAUDE=1 to run)");
 }
 
 console.log(failures ? `\n${failures} FAILED` : "\nALL PASSED");
